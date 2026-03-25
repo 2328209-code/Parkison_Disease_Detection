@@ -633,23 +633,55 @@ with tabs[3]:
         if pred_file:
             pred_df = pd.read_csv(pred_file)
             st.write("Uploaded shape:", pred_df.shape)
-            # align features
-            st.warning("ℹ️ For accurate CSV predictions, ensure the CSV has the same features as training data.")
 
-            # Simple approach: scale the raw CSV features
             try:
-                X_raw = pred_df.values[:, r["best_idx"]]
-                X_scaled_new = r["scaler"].transform(
-                    np.pad(X_raw, ((0,0),(0, r["scaler"].n_features_in_ - X_raw.shape[1])))
-                    if X_raw.shape[1] < r["scaler"].n_features_in_ else X_raw
-                )[:, :len(r["best_idx"])]
-                preds = r["hybrid"].predict(X_scaled_new)
-                probs = r["hybrid"].predict_proba(X_scaled_new)[:, 1]
-                pred_df["Prediction"] = ["Parkinson's 🔴" if p == 1 else "Healthy 🟢" for p in preds]
-                pred_df["Probability"] = probs.round(4)
-                st.dataframe(pred_df[["Prediction","Probability"]], use_container_width=True)
+                # Step 1: drop non-numeric and known label/id columns
+                cols_to_drop = [c for c in pred_df.columns
+                                if c.lower() in ("id", "name", "class", "label", "target")
+                                or not pd.api.types.is_numeric_dtype(pred_df[c])]
+                X_clean = pred_df.drop(columns=cols_to_drop, errors="ignore").astype(float)
+
+                n_scaler = r["scaler"].n_features_in_
+                n_cols   = X_clean.shape[1]
+
+                # Step 2: align column count to what scaler expects
+                if n_cols >= n_scaler:
+                    X_aligned = X_clean.iloc[:, :n_scaler].values
+                else:
+                    pad = np.zeros((len(X_clean), n_scaler - n_cols))
+                    X_aligned = np.hstack([X_clean.values, pad])
+
+                # Step 3: scale then select PSO features
+                X_scaled  = r["scaler"].transform(X_aligned.astype(np.float64))
+                best_idx  = r["best_idx"]
+                valid_idx = best_idx[best_idx < X_scaled.shape[1]]
+                X_pso     = X_scaled[:, valid_idx]
+
+                preds = r["hybrid"].predict(X_pso)
+                probs = r["hybrid"].predict_proba(X_pso)[:, 1]
+
+                result_df = pred_df.copy()
+                result_df["Prediction"] = ["Parkinson's 🔴" if p == 1 else "Healthy 🟢" for p in preds]
+                result_df["Probability (Parkinson's)"] = probs.round(4)
+
+                st.success(f"Predictions complete for {len(preds)} sample(s).")
+                if cols_to_drop:
+                    st.info(f"Dropped non-numeric/label columns before prediction: {cols_to_drop}")
+
+                st.dataframe(
+                    result_df[["Prediction", "Probability (Parkinson's)"]],
+                    use_container_width=True
+                )
+
+                n_park = int((preds == 1).sum())
+                n_heal = int((preds == 0).sum())
+                ca, cb = st.columns(2)
+                ca.metric("Parkinson's 🔴", n_park)
+                cb.metric("Healthy 🟢",     n_heal)
+
             except Exception as e:
                 st.error(f"Prediction error: {e}")
+                st.caption("Make sure the CSV has numeric feature columns matching the training data.")
 
     # ── Manual input ─────────────────────────────────────────
     else:
@@ -675,14 +707,15 @@ with tabs[3]:
         if st.button("🔮  PREDICT", use_container_width=False):
             # Build full feature vector (zeros for unseen features)
             full_vec = np.zeros(r["scaler"].n_features_in_)
-            # fill in only the PSO-selected ones
+            # fill in only the PSO-selected ones (use fi as the column index, not i)
             for i, fi in enumerate(best_idx):
-                if fi in feature_vals and i < r["scaler"].n_features_in_:
-                    full_vec[i] = feature_vals[fi]
+                if fi in feature_vals and fi < r["scaler"].n_features_in_:
+                    full_vec[fi] = feature_vals[fi]
 
             vec_scaled = r["scaler"].transform(full_vec.reshape(1, -1))
-            # Pick only PSO features
-            vec_pso = vec_scaled[:, np.arange(len(best_idx))]
+            # Pick only PSO-selected features (guard against out-of-range indices)
+            valid_idx = best_idx[best_idx < vec_scaled.shape[1]]
+            vec_pso   = vec_scaled[:, valid_idx]
 
             pred  = r["hybrid"].predict(vec_pso)[0]
             prob  = r["hybrid"].predict_proba(vec_pso)[0, 1]
