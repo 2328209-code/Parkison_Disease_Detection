@@ -634,13 +634,6 @@ with tabs[3]:
             pred_df = pd.read_csv(pred_file)
             st.write("Uploaded shape:", pred_df.shape)
             # align features
-            X_new = pred_df.iloc[:, r["best_idx"]] if pred_df.shape[1] > max(r["best_idx"]) \
-                    else pred_df
-            X_new_s = r["scaler"].transform(
-                pd.DataFrame(r["scaler"].inverse_transform(
-                    np.zeros((len(pred_df), len(r["best_idx"])))
-                ))  # fallback: zeros
-            )
             st.warning("ℹ️ For accurate CSV predictions, ensure the CSV has the same features as training data.")
 
             # Simple approach: scale the raw CSV features
