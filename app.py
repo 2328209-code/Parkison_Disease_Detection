@@ -1,32 +1,40 @@
-# =============================================================================
-# Parkinson's Disease Detection - Streamlit App
-# Dark Theme + PSO + Hybrid Model (RF + XGBoost)
-# =============================================================================
-# Requirements:
-#   pip install streamlit numpy pandas scikit-learn xgboost imbalanced-learn seaborn matplotlib
-# Run:
-#   streamlit run parkinsons_app.py
-# =============================================================================
+"""
+Parkinson's Disease Detection — Streamlit Dashboard
+====================================================
+Report pipeline: Yeo-Johnson → LASSO+RFECV → SVM-RBF / Deep MLP
+               → Optuna → Platt Calibration → SHAP
 
-import os
+Run:
+    streamlit run app.py
+"""
+
 import io
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import seaborn as sns
 import streamlit as st
-import warnings
-warnings.filterwarnings("ignore")
 
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import mutual_info_classif, VarianceThreshold
-from sklearn.metrics import (classification_report, roc_auc_score,
-                             roc_curve, auc, confusion_matrix, accuracy_score)
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from xgboost import XGBClassifier
+from sklearn.model_selection import (train_test_split, StratifiedKFold,
+                                     cross_val_score)
+from sklearn.preprocessing import PowerTransformer
+from sklearn.feature_selection import VarianceThreshold, RFECV
+from sklearn.linear_model import LassoCV
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.calibration import CalibratedClassifierCV, calibration_curve
+from sklearn.metrics import (accuracy_score, roc_auc_score, precision_score,
+                             recall_score, f1_score, brier_score_loss,
+                             roc_curve, confusion_matrix, classification_report)
+
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+import shap
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG & DARK THEME
@@ -38,27 +46,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Inject custom CSS for black/dark theme
 st.markdown("""
 <style>
-/* ── Global dark background ── */
 html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"] {
     background-color: #0a0a0a !important;
     color: #e0e0e0 !important;
     font-family: 'Courier New', monospace !important;
 }
-
-/* ── Sidebar ── */
 [data-testid="stSidebar"] {
     background-color: #111111 !important;
     border-right: 1px solid #2a2a2a !important;
 }
 [data-testid="stSidebar"] * { color: #cccccc !important; }
-
-/* ── Main content blocks ── */
-[data-testid="stVerticalBlock"] > div { background: transparent !important; }
-
-/* ── Metric cards ── */
 [data-testid="stMetric"] {
     background: #141414 !important;
     border: 1px solid #2a9d8f !important;
@@ -67,70 +66,41 @@ html, body, [data-testid="stApp"], [data-testid="stAppViewContainer"] {
 }
 [data-testid="stMetricValue"] { color: #2a9d8f !important; font-size: 2rem !important; }
 [data-testid="stMetricLabel"] { color: #888888 !important; }
-
-/* ── Buttons ── */
 .stButton > button {
     background: linear-gradient(135deg, #2a9d8f, #1a7a6e) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 6px !important;
-    font-weight: bold !important;
-    letter-spacing: 1px !important;
-    padding: 0.5rem 1.5rem !important;
-    transition: all 0.3s ease !important;
+    color: white !important; border: none !important;
+    border-radius: 6px !important; font-weight: bold !important;
+    letter-spacing: 1px !important; padding: 0.5rem 1.5rem !important;
 }
 .stButton > button:hover {
     background: linear-gradient(135deg, #38c9b6, #2a9d8f) !important;
     box-shadow: 0 0 18px rgba(42,157,143,0.5) !important;
 }
-
-/* ── File uploader ── */
 [data-testid="stFileUploader"] {
     border: 1px dashed #2a9d8f !important;
-    border-radius: 8px !important;
-    padding: 10px !important;
+    border-radius: 8px !important; padding: 10px !important;
 }
-
-/* ── Sliders, select boxes ── */
-.stSlider > div > div { background: #2a9d8f !important; }
-
-/* ── Tabs ── */
 .stTabs [data-baseweb="tab-list"] {
-    background: #111111 !important;
-    border-bottom: 1px solid #2a2a2a !important;
+    background: #111111 !important; border-bottom: 1px solid #2a2a2a !important;
 }
 .stTabs [data-baseweb="tab"] {
-    color: #888888 !important;
-    font-family: 'Courier New', monospace !important;
-    letter-spacing: 1px !important;
+    color: #888888 !important; font-family: 'Courier New', monospace !important;
 }
 .stTabs [aria-selected="true"] {
-    color: #2a9d8f !important;
-    border-bottom: 2px solid #2a9d8f !important;
+    color: #2a9d8f !important; border-bottom: 2px solid #2a9d8f !important;
 }
-
-/* ── DataFrame ── */
-[data-testid="stDataFrame"] { border: 1px solid #2a2a2a !important; }
-
-/* ── Expander ── */
+h1, h2, h3 { color: #2a9d8f !important; letter-spacing: 2px !important; }
+h1 { border-bottom: 1px solid #2a2a2a; padding-bottom: 10px; }
 .streamlit-expanderHeader {
     background: #141414 !important;
     border: 1px solid #2a2a2a !important;
     color: #2a9d8f !important;
 }
-
-/* ── Success / error alerts ── */
-[data-testid="stAlert"] { border-radius: 8px !important; }
-
-/* ── Headers ── */
-h1, h2, h3 { color: #2a9d8f !important; letter-spacing: 2px !important; }
-h1 { border-bottom: 1px solid #2a2a2a; padding-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# MATPLOTLIB DARK THEME HELPER
+# THEME CONSTANTS & HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 DARK_BG  = "#0a0a0a"
 CARD_BG  = "#141414"
@@ -141,27 +111,20 @@ YELLOW   = "#e9c46a"
 GRID_COL = "#2a2a2a"
 TEXT_COL = "#cccccc"
 
-def apply_dark_style():
+
+def _dark_rc():
     plt.rcParams.update({
-        "figure.facecolor":  DARK_BG,
-        "axes.facecolor":    CARD_BG,
-        "axes.edgecolor":    GRID_COL,
-        "axes.labelcolor":   TEXT_COL,
-        "xtick.color":       TEXT_COL,
-        "ytick.color":       TEXT_COL,
-        "text.color":        TEXT_COL,
-        "grid.color":        GRID_COL,
-        "grid.alpha":        0.6,
-        "legend.facecolor":  CARD_BG,
-        "legend.edgecolor":  GRID_COL,
-        "font.family":       "monospace",
-        "axes.titlecolor":   TEAL,
-        "axes.titlesize":    12,
-        "axes.labelsize":    10,
+        "figure.facecolor": DARK_BG, "axes.facecolor": CARD_BG,
+        "axes.edgecolor": GRID_COL, "axes.labelcolor": TEXT_COL,
+        "xtick.color": TEXT_COL, "ytick.color": TEXT_COL,
+        "text.color": TEXT_COL, "grid.color": GRID_COL,
+        "legend.facecolor": CARD_BG, "legend.edgecolor": GRID_COL,
+        "font.family": "monospace", "axes.titlecolor": TEAL,
+        "axes.titlesize": 12, "axes.labelsize": 10,
     })
 
 
-def fig_to_streamlit(fig):
+def _show(fig):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
                 facecolor=DARK_BG, edgecolor="none")
@@ -171,270 +134,288 @@ def fig_to_streamlit(fig):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CACHED PIPELINE
+# PIPELINE FUNCTIONS (cached)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def load_and_preprocess(file_bytes: bytes):
+    """Load CSV and run Yeo-Johnson + LASSO+RFECV."""
     from io import BytesIO
-    df = pd.read_csv(BytesIO(file_bytes), sep=",", skiprows=1)
-    X = df.drop("class", axis=1)
-    y = df["class"]
+    df = pd.read_csv(BytesIO(file_bytes), sep=",")
+    TARGET = "status"
+    y = df[TARGET].values.astype(int)
+    X = df.drop(columns=[TARGET]).select_dtypes(include=[np.number])
+    X = X.fillna(X.median())
+    feature_names = list(X.columns)
+
+    # Split first (preprocessing fitted on train only)
+    X_tr_raw, X_te_raw, y_tr, y_te = train_test_split(
+        X.values, y, test_size=0.20, stratify=y, random_state=42)
+
+    # Yeo-Johnson
+    pt = PowerTransformer(method="yeo-johnson", standardize=True)
+    X_tr_yj = pt.fit_transform(X_tr_raw)
+    X_te_yj = pt.transform(X_te_raw)
 
     # Variance filter
-    vf = VarianceThreshold(threshold=0.01)
-    X_var = pd.DataFrame(vf.fit_transform(X))
+    vt = VarianceThreshold(threshold=0.01)
+    X_tr_vt = vt.fit_transform(X_tr_yj)
+    X_te_vt = vt.transform(X_te_yj)
 
-    # Correlation filter
-    corr = X_var.corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    to_drop = [c for c in upper.columns if any(upper[c] > 0.90)]
-    X_filt = X_var.drop(columns=to_drop)
+    # LassoCV screening
+    lasso = LassoCV(cv=10, max_iter=5000, random_state=42, n_jobs=None)
+    lasso.fit(X_tr_vt, y_tr)
+    lmask = np.abs(lasso.coef_) > 0
+    if lmask.sum() < 5:
+        lmask = np.abs(lasso.coef_) > np.percentile(np.abs(lasso.coef_), 80)
+    X_tr_l = X_tr_vt[:, lmask]
+    X_te_l = X_te_vt[:, lmask]
 
-    # Mutual information
-    mi = mutual_info_classif(X_filt, y)
-    mi_df = pd.DataFrame({"Feature": X_filt.columns, "MI Score": mi})
-    mi_df = mi_df.sort_values("MI Score", ascending=False)
+    # RFECV
+    svm_lin = SVC(kernel="linear", random_state=42)
+    rfecv = RFECV(
+        estimator=svm_lin,
+        step=max(1, X_tr_l.shape[1] // 20),
+        cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+        scoring="roc_auc",
+        min_features_to_select=10,
+        n_jobs=None,
+    )
+    rfecv.fit(X_tr_l, y_tr)
+    X_tr_sel = rfecv.transform(X_tr_l)
+    X_te_sel = rfecv.transform(X_te_l)
 
-    top80 = mi_df.head(80)["Feature"].values
-    X_mi = X_filt[top80]
+    # Rebuild selected feature names
+    vt_names    = [feature_names[i] for i, s in enumerate(vt.get_support()) if s]
+    lasso_names = [vt_names[i] for i, s in enumerate(lmask) if s]
+    sel_names   = [lasso_names[i] for i, s in enumerate(rfecv.support_) if s]
 
-    return df, X_mi, y, mi_df
-
-
-@st.cache_resource(show_spinner=False)
-def run_pso_and_train(X_mi_json: str, y_json: str):
-    X_mi = pd.read_json(X_mi_json)
-    y    = pd.read_json(y_json, typ="series")
-
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X_mi, y, test_size=0.2, random_state=42, stratify=y)
-
-    scaler = StandardScaler()
-    X_tr_s = scaler.fit_transform(X_tr)
-    X_te_s = scaler.transform(X_te)
-
-    # ── PSO ──────────────────────────────────────────────────
-    n_p, n_it = 20, 25
-    w, c1, c2 = 0.7, 1.5, 1.5
-    nf = X_tr_s.shape[1]
-
-    pos = np.random.randint(0, 2, (n_p, nf))
-    vel = np.random.uniform(-1, 1, (n_p, nf))
-    pb_pos = pos.copy()
-    pb_sc  = np.zeros(n_p)
-    gb_pos = None
-    gb_sc  = 0.0
-    pso_hist = []
-
-    def fitness(p):
-        sel = np.where(p == 1)[0]
-        if len(sel) == 0:
-            return 0
-        m = RandomForestClassifier(n_estimators=50, random_state=42)
-        s = cross_val_score(m, X_tr_s[:, sel], y_tr, cv=3).mean()
-        return 0.99 * s - 0.01 * len(sel) / nf
-
-    for it in range(n_it):
-        for i in range(n_p):
-            sc = fitness(pos[i])
-            if sc > pb_sc[i]:
-                pb_sc[i]  = sc
-                pb_pos[i] = pos[i].copy()
-            if sc > gb_sc:
-                gb_sc  = sc
-                gb_pos = pos[i].copy()
-        for i in range(n_p):
-            r1 = np.random.rand(nf)
-            r2 = np.random.rand(nf)
-            vel[i] = (w * vel[i]
-                      + c1 * r1 * (pb_pos[i] - pos[i])
-                      + c2 * r2 * (gb_pos   - pos[i]))
-            sig = 1 / (1 + np.exp(-vel[i]))
-            pos[i] = np.where(np.random.rand(nf) < sig, 1, 0)
-        pso_hist.append(gb_sc)
-
-    best_idx = np.where(gb_pos == 1)[0]
-    X_tr_pso = X_tr_s[:, best_idx]
-    X_te_pso = X_te_s[:, best_idx]
-
-    # ── Hybrid RF + XGBoost ────────────────────────────────────
-    rf  = RandomForestClassifier(n_estimators=200, random_state=42)
-    xgb = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
-                        use_label_encoder=False, eval_metric="logloss",
-                        random_state=42)
-    hybrid = VotingClassifier([("rf", rf), ("xgb", xgb)], voting="soft")
-    hybrid.fit(X_tr_pso, y_tr)
-
-    y_pred = hybrid.predict(X_te_pso)
-    y_prob = hybrid.predict_proba(X_te_pso)[:, 1]
-    acc    = accuracy_score(y_te, y_pred)
-    roc_sc = roc_auc_score(y_te, y_prob)
-    cm     = confusion_matrix(y_te, y_pred)
-    fpr, tpr, _ = roc_curve(y_te, y_prob)
-    report = classification_report(y_te, y_pred, output_dict=True)
+    skew_before = pd.DataFrame(X_tr_raw).skew().abs().median()
+    skew_after  = pd.DataFrame(X_tr_yj).skew().abs().median()
 
     return {
-        "hybrid":    hybrid,
-        "scaler":    scaler,
-        "best_idx":  best_idx,
-        "acc":       acc,
-        "roc":       roc_sc,
-        "cm":        cm,
-        "fpr":       fpr,
-        "tpr":       tpr,
-        "pso_hist":  pso_hist,
-        "report":    report,
-        "n_pso_feat": len(best_idx),
-        "y_test":    y_te,
-        "y_pred":    y_pred,
-        "y_prob":    y_prob,
-        "X_test_pso": X_te_pso,
+        "df": df, "y_tr": y_tr, "y_te": y_te,
+        "X_tr_sel": X_tr_sel, "X_te_sel": X_te_sel,
+        "sel_names": sel_names,
+        "n_raw": X.shape[1], "n_sel": X_tr_sel.shape[1],
+        "skew_before": skew_before, "skew_after": skew_after,
+        "power_tf": pt, "vt": vt, "lasso_mask": lmask,
+        "rfecv": rfecv,
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHART FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
-def plot_mi_scores(mi_df):
-    apply_dark_style()
-    top = mi_df.head(20)
-    fig, ax = plt.subplots(figsize=(10, 4))
-    bars = ax.bar(range(len(top)), top["MI Score"],
-                  color=[TEAL if i % 2 == 0 else TEAL2 for i in range(len(top))],
-                  edgecolor=DARK_BG, linewidth=0.5)
-    ax.set_xticks(range(len(top)))
-    ax.set_xticklabels([f"F{f}" for f in top["Feature"]], rotation=45, ha="right", fontsize=8)
-    ax.set_title("Top 20 Mutual Information Scores", fontsize=13, pad=12)
-    ax.set_ylabel("MI Score")
-    ax.set_xlabel("Feature Index")
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
-    ax.spines[["top","right"]].set_visible(False)
-    fig.tight_layout()
-    return fig
+@st.cache_resource(show_spinner=False)
+def run_optuna_and_train(cache_key: str, X_tr_json: str, y_tr_json: str,
+                         model_type: str, n_trials: int):
+    """Optuna search + final calibrated model."""
+    X_tr = np.array(pd.read_json(X_tr_json))
+    y_tr = np.array(pd.read_json(y_tr_json, typ="series"))
 
+    cv5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    trial_history = []
 
-def plot_class_distribution(y):
-    apply_dark_style()
-    counts = y.value_counts()
-    labels = ["Healthy (0)", "Parkinson's (1)"]
-    colors = [TEAL, ORANGE]
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4))
+    def objective(trial):
+        if model_type == "svm_rbf":
+            C     = trial.suggest_float("C",     1e-3, 1e3, log=True)
+            gamma = trial.suggest_float("gamma", 1e-4, 10,  log=True)
+            m = SVC(C=C, gamma=gamma, kernel="rbf",
+                    probability=True, random_state=42)
+        else:
+            lr = trial.suggest_float("learning_rate_init", 1e-5, 1e-2, log=True)
+            alpha = trial.suggest_float("alpha", 1e-5, 1e-2, log=True)
+            h = trial.suggest_categorical("hidden_layer_sizes",
+                                          [(256,128,64),(128,64,32),(256,128),(512,256,128,64)])
+            m = MLPClassifier(hidden_layer_sizes=h, activation="relu",
+                              learning_rate_init=lr, alpha=alpha,
+                              max_iter=500, early_stopping=True,
+                              validation_fraction=0.1, random_state=42)
+        sc = cross_val_score(m, X_tr, y_tr, cv=cv5, scoring="roc_auc", n_jobs=None).mean()
+        trial_history.append(sc)
+        return sc
 
-    # Bar
-    axes[0].bar(labels, counts.values, color=colors, edgecolor=DARK_BG, linewidth=1.5, width=0.5)
-    axes[0].set_title("Class Distribution", pad=10)
-    axes[0].set_ylabel("Count")
-    axes[0].grid(axis="y", linestyle="--", alpha=0.4)
-    axes[0].spines[["top","right"]].set_visible(False)
-    for i, v in enumerate(counts.values):
-        axes[0].text(i, v + 2, str(v), ha="center", color=TEXT_COL, fontsize=11, fontweight="bold")
-
-    # Pie
-    wedges, texts, autotexts = axes[1].pie(
-        counts.values, labels=labels, colors=colors,
-        autopct="%1.1f%%", startangle=90,
-        wedgeprops={"edgecolor": DARK_BG, "linewidth": 2},
-        textprops={"color": TEXT_COL}
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=42),
+        pruner=optuna.pruners.HyperbandPruner(),
     )
-    for at in autotexts:
-        at.set_color(DARK_BG); at.set_fontweight("bold")
-    axes[1].set_title("Class Proportions", pad=10)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    bp = study.best_params
 
-    fig.tight_layout()
-    return fig
+    if model_type == "svm_rbf":
+        base = SVC(C=bp["C"], gamma=bp["gamma"], kernel="rbf",
+                   probability=True, random_state=42)
+    else:
+        h = bp.get("hidden_layer_sizes", (256,128,64))
+        if isinstance(h, str): h = eval(h)
+        base = MLPClassifier(hidden_layer_sizes=h, activation="relu",
+                             learning_rate_init=bp.get("learning_rate_init", 1e-3),
+                             alpha=bp.get("alpha", 1e-4),
+                             max_iter=500, early_stopping=True,
+                             validation_fraction=0.1, random_state=42)
 
-
-def plot_pso_convergence(pso_hist):
-    apply_dark_style()
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(range(1, len(pso_hist)+1), pso_hist,
-            color=TEAL, linewidth=2.5, marker="o", markersize=4,
-            markerfacecolor=ORANGE, markeredgecolor=DARK_BG)
-    ax.fill_between(range(1, len(pso_hist)+1), pso_hist,
-                    alpha=0.15, color=TEAL)
-    ax.set_title("PSO Convergence – Global Best Fitness", pad=12)
-    ax.set_xlabel("Iteration")
-    ax.set_ylabel("Fitness Score")
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.spines[["top","right"]].set_visible(False)
-    fig.tight_layout()
-    return fig
+    cal_model = CalibratedClassifierCV(base, cv=5, method="sigmoid")
+    cal_model.fit(X_tr, y_tr)
+    return {"model": cal_model, "best_params": bp,
+            "best_cv_auc": study.best_value, "trial_history": trial_history}
 
 
-def plot_confusion_matrix(cm):
-    apply_dark_style()
-    fig, ax = plt.subplots(figsize=(5, 4.5))
+def compute_shap(model, X_train, X_test, sel_names):
+    try:
+        background  = shap.kmeans(X_train, min(50, X_train.shape[0]))
+        explainer   = shap.KernelExplainer(model.predict_proba, background)
+        n           = min(60, X_test.shape[0])
+        sv          = explainer.shap_values(X_test[:n], nsamples=100)
+        if isinstance(sv, list):
+            sv1 = sv[1]
+        elif len(sv.shape) == 3:
+            sv1 = sv[:, :, 1]
+        else:
+            sv1 = sv
+        bv          = explainer.expected_value
+        if isinstance(bv, (list, np.ndarray)): bv = bv[1]
+        return {"explainer": explainer, "sv": sv1, "bv": bv,
+                "X_shap": X_test[:n], "names": sel_names}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHART BUILDERS
+# ─────────────────────────────────────────────────────────────────────────────
+def _class_dist(y):
+    _dark_rc()
+    counts = pd.Series(y).value_counts()
+    labels = ["Healthy (0)", "Parkinson's (1)"]
+    fig, axes = plt.subplots(1, 2, figsize=(9, 3.5))
+    axes[0].bar(labels, [counts.get(0,0), counts.get(1,0)],
+                color=[TEAL, ORANGE], edgecolor=DARK_BG, width=0.5)
+    axes[0].set_title("Class Distribution"); axes[0].grid(axis="y", alpha=0.3)
+    axes[0].spines[["top","right"]].set_visible(False)
+    for i, v in enumerate([counts.get(0,0), counts.get(1,0)]):
+        axes[0].text(i, v+1, str(v), ha="center", fontweight="bold")
+    wedges, texts, autotexts = axes[1].pie(
+        [counts.get(0,0), counts.get(1,0)], labels=labels,
+        colors=[TEAL, ORANGE], autopct="%1.1f%%", startangle=90,
+        wedgeprops={"edgecolor": DARK_BG, "linewidth": 2},
+        textprops={"color": TEXT_COL})
+    for at in autotexts: at.set_color(DARK_BG); at.set_fontweight("bold")
+    axes[1].set_title("Class Proportions")
+    fig.tight_layout(); return fig
+
+
+def _skewness_bars(sk_before, sk_after):
+    _dark_rc()
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.bar(["Before\nYeo-Johnson", "After\nYeo-Johnson"],
+           [sk_before, sk_after], color=[ORANGE, TEAL],
+           edgecolor=DARK_BG, width=0.4)
+    ax.set_title("Median |Skewness| of Features"); ax.set_ylabel("Median |Skewness|")
+    ax.grid(axis="y", alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+    for i, v in enumerate([sk_before, sk_after]):
+        ax.text(i, v + 0.01, f"{v:.3f}", ha="center", fontweight="bold")
+    fig.tight_layout(); return fig
+
+
+def _optuna_history(trial_history):
+    _dark_rc()
+    running_best = np.maximum.accumulate(trial_history)
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    ax.plot(range(1, len(trial_history)+1), trial_history,
+            color=GRID_COL, lw=1, alpha=0.6, label="Trial AUC")
+    ax.plot(range(1, len(running_best)+1), running_best,
+            color=TEAL, lw=2.5, marker="o", markersize=3,
+            markerfacecolor=ORANGE, markeredgecolor=DARK_BG, label="Best AUC")
+    ax.fill_between(range(1, len(running_best)+1), running_best, alpha=0.12, color=TEAL)
+    ax.set_title("Optuna Bayesian Optimisation Convergence")
+    ax.set_xlabel("Trial"); ax.set_ylabel("CV AUC-ROC")
+    ax.legend(); ax.grid(alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+    fig.tight_layout(); return fig
+
+
+def _confusion_matrix(cm):
+    _dark_rc()
     cmap = matplotlib.colors.LinearSegmentedColormap.from_list(
         "teal_dark", [CARD_BG, TEAL], N=256)
+    fig, ax = plt.subplots(figsize=(5, 4.5))
     im = ax.imshow(cm, cmap=cmap)
     ax.set_xticks([0,1]); ax.set_yticks([0,1])
-    ax.set_xticklabels(["Healthy","Parkinson's"], fontsize=10)
-    ax.set_yticklabels(["Healthy","Parkinson's"], fontsize=10)
-    ax.set_xlabel("Predicted Label", fontsize=11)
-    ax.set_ylabel("Actual Label", fontsize=11)
-    ax.set_title("Confusion Matrix", fontsize=13, pad=12)
+    ax.set_xticklabels(["Healthy","Parkinson's"]); ax.set_yticklabels(["Healthy","Parkinson's"])
+    ax.set_xlabel("Predicted Label"); ax.set_ylabel("Actual Label")
+    ax.set_title("Confusion Matrix")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     for i in range(2):
         for j in range(2):
-            ax.text(j, i, str(cm[i, j]),
-                    ha="center", va="center", fontsize=20, fontweight="bold",
+            ax.text(j, i, str(cm[i,j]), ha="center", va="center",
+                    fontsize=20, fontweight="bold",
                     color=DARK_BG if cm[i,j] > cm.max()/2 else TEXT_COL)
-    fig.tight_layout()
-    return fig
+    fig.tight_layout(); return fig
 
 
-def plot_roc_curve(fpr, tpr, roc_score):
-    apply_dark_style()
+def _roc(fpr, tpr, auc_sc, label="Model"):
+    _dark_rc()
     fig, ax = plt.subplots(figsize=(5.5, 5))
-    ax.plot(fpr, tpr, color=TEAL, linewidth=3,
-            label=f"Hybrid Model  AUC = {roc_score:.4f}")
+    ax.plot(fpr, tpr, color=TEAL, lw=3, label=f"{label}  AUC = {auc_sc:.4f}")
     ax.fill_between(fpr, tpr, alpha=0.10, color=TEAL)
-    ax.plot([0,1],[0,1], linestyle="--", color=ORANGE, linewidth=1.5, label="Random")
-    ax.set_xlabel("False Positive Rate", fontsize=11)
-    ax.set_ylabel("True Positive Rate", fontsize=11)
-    ax.set_title("ROC Curve", fontsize=13, pad=12)
-    ax.legend(loc="lower right", fontsize=9)
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.spines[["top","right"]].set_visible(False)
-    fig.tight_layout()
-    return fig
+    ax.plot([0,1],[0,1], "--", color=ORANGE, lw=1.5, label="Random")
+    ax.set_xlabel("False Positive Rate"); ax.set_ylabel("True Positive Rate")
+    ax.set_title("ROC Curve"); ax.legend(loc="lower right")
+    ax.grid(alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+    fig.tight_layout(); return fig
 
 
-def plot_feature_importance(hybrid_model, n_pso_feat):
-    apply_dark_style()
-    rf_imp = hybrid_model.estimators_[0].feature_importances_
-    top_n  = min(20, len(rf_imp))
-    idx    = np.argsort(rf_imp)[-top_n:][::-1]
-    fig, ax = plt.subplots(figsize=(9, 4))
-    colors = [TEAL if i % 2 == 0 else TEAL2 for i in range(top_n)]
-    ax.barh(range(top_n), rf_imp[idx][::-1], color=colors[::-1],
-            edgecolor=DARK_BG, linewidth=0.5)
-    ax.set_yticks(range(top_n))
-    ax.set_yticklabels([f"PSO-Feature {i}" for i in idx[::-1]], fontsize=8)
-    ax.set_title(f"Top {top_n} RF Feature Importances (PSO-selected)", pad=12)
-    ax.set_xlabel("Importance")
-    ax.grid(axis="x", linestyle="--", alpha=0.4)
-    ax.spines[["top","right"]].set_visible(False)
-    fig.tight_layout()
-    return fig
+def _calibration(y_test, probs):
+    _dark_rc()
+    pt, pp = calibration_curve(y_test, probs, n_bins=10)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.plot(pp, pt, "s-", color=TEAL, lw=2, label="Model")
+    ax.plot([0,1],[0,1], "--", color=ORANGE, lw=1.5, label="Perfect")
+    ax.set_xlabel("Mean Predicted Probability"); ax.set_ylabel("Fraction of Positives")
+    ax.set_title("Calibration Curve (Brier score = lower is better)")
+    ax.legend(); ax.grid(alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+    fig.tight_layout(); return fig
 
 
-def plot_probability_distribution(y_prob, y_test):
-    apply_dark_style()
-    fig, ax = plt.subplots(figsize=(8, 4))
-    healthy    = y_prob[y_test == 0]
-    parkinsons = y_prob[y_test == 1]
-    ax.hist(healthy,    bins=20, color=TEAL,   alpha=0.7, label="Healthy",       edgecolor=DARK_BG)
-    ax.hist(parkinsons, bins=20, color=ORANGE, alpha=0.7, label="Parkinson's",   edgecolor=DARK_BG)
-    ax.axvline(0.5, color=YELLOW, linestyle="--", linewidth=1.5, label="Threshold 0.5")
-    ax.set_title("Prediction Probability Distribution", pad=12)
-    ax.set_xlabel("Predicted Probability (Parkinson's)")
-    ax.set_ylabel("Count")
-    ax.legend(fontsize=9)
-    ax.grid(linestyle="--", alpha=0.4)
-    ax.spines[["top","right"]].set_visible(False)
-    fig.tight_layout()
-    return fig
+def _prob_distribution(probs, y_test):
+    _dark_rc()
+    fig, ax = plt.subplots(figsize=(8, 3.5))
+    ax.hist(probs[y_test==0], bins=20, color=TEAL,   alpha=0.7,
+            label="Healthy", edgecolor=DARK_BG)
+    ax.hist(probs[y_test==1], bins=20, color=ORANGE, alpha=0.7,
+            label="Parkinson's", edgecolor=DARK_BG)
+    ax.axvline(0.5, color=YELLOW, ls="--", lw=1.5, label="Threshold 0.5")
+    ax.set_title("Prediction Probability Distribution")
+    ax.set_xlabel("P(Parkinson's)"); ax.set_ylabel("Count")
+    ax.legend(); ax.grid(alpha=0.3); ax.spines[["top","right"]].set_visible(False)
+    fig.tight_layout(); return fig
+
+
+def _shap_summary(shap_data):
+    fig, _ = plt.subplots(figsize=(10, 5))
+    shap.summary_plot(shap_data["sv"], shap_data["X_shap"],
+                      feature_names=shap_data["names"], show=False, plot_type="dot")
+    plt.tight_layout(); return fig
+
+
+def _shap_bar(shap_data):
+    fig, _ = plt.subplots(figsize=(9, 4))
+    shap.summary_plot(shap_data["sv"], shap_data["X_shap"],
+                      feature_names=shap_data["names"], show=False,
+                      plot_type="bar", max_display=15)
+    plt.tight_layout(); return fig
+
+
+def _shap_waterfall(shap_data, idx=0):
+    try:
+        expl = shap.Explanation(
+            values=shap_data["sv"][idx],
+            base_values=shap_data["bv"],
+            data=shap_data["X_shap"][idx],
+            feature_names=shap_data["names"],
+        )
+        fig, _ = plt.subplots(figsize=(10, 5))
+        shap.waterfall_plot(expl, show=False, max_display=15)
+        plt.tight_layout(); return fig
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -443,301 +424,347 @@ def plot_probability_distribution(y_prob, y_test):
 with st.sidebar:
     st.markdown("## 🧠 Parkinson's Detector")
     st.markdown("---")
-    st.markdown("**Model:** RF + XGBoost (Soft Voting)")
-    st.markdown("**Feature Selection:** PSO + MI")
+    st.markdown("**Pipeline (Report Chapter 5)**")
+    st.markdown("""
+    1. Yeo-Johnson Normalisation
+    2. LASSO + RFECV Feature Selection
+    3. SVM-RBF **or** Deep MLP
+    4. Bayesian Optimisation (Optuna)
+    5. Platt Calibration
+    6. SHAP Interpretability
+    """)
     st.markdown("---")
     st.markdown("### Upload Dataset")
     uploaded = st.file_uploader(
-        "pd_speech_features.csv", type=["csv"],
-        help="Upload the Parkinson's speech features CSV."
+        "parkinsons.csv", type=["csv"],
+        help="UCI Parkinson's dataset"
     )
     st.markdown("---")
-    st.markdown("### Manual Prediction")
-    st.caption("After training, enter values below:")
-    n_manual = st.number_input("Number of features to enter", min_value=1, max_value=10, value=5)
+    model_choice   = st.selectbox("Model", ["svm_rbf", "deep_mlp"],
+                                  format_func=lambda x: "SVM-RBF" if x=="svm_rbf" else "Deep MLP")
+    n_trials       = st.slider("Optuna Trials", 10, 100, 30, step=10)
+    show_shap      = st.checkbox("Enable SHAP (slower)", value=True)
     st.markdown("---")
-    st.caption("© 2025 Parkinson's AI Lab")
+    st.caption("© 2025 · KIIT University · Subham Barman")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
-st.markdown("# 🧠 Parkinson's Disease Detection System")
+st.markdown("# 🧠 Parkinson's Disease Detection")
 st.markdown(
     "<p style='color:#888;font-size:0.9rem;letter-spacing:1px'>"
-    "Hybrid Machine Learning Pipeline · PSO Feature Selection · RF + XGBoost Ensemble"
-    "</p>", unsafe_allow_html=True
+    "Explainable Precision Diagnostics · Yeo-Johnson · LASSO-RFECV · "
+    "SVM-RBF / Deep MLP · Optuna · SHAP</p>",
+    unsafe_allow_html=True,
 )
 
 if uploaded is None:
-    st.info("👈  Upload **pd_speech_features.csv** in the sidebar to begin.", icon="📂")
+    st.info("👈  Upload **parkinsons.csv** in the sidebar to begin.", icon="📂")
     st.stop()
 
-# ── Load & preprocess ─────────────────────────────────────────────────────────
+# ── Preprocessing ──────────────────────────────────────────────────────────────
 file_bytes = uploaded.read()
-with st.spinner("🔄 Loading and preprocessing dataset…"):
-    df, X_mi, y, mi_df = load_and_preprocess(file_bytes)
+with st.spinner("🔄 Preprocessing: Yeo-Johnson → LASSO → RFECV …"):
+    data = load_and_preprocess(file_bytes)
 
 tabs = st.tabs([
     "📊 Dataset Overview",
     "⚙️ Train Model",
-    "📈 Results & Charts",
+    "📈 Results & Evaluation",
+    "📊 SHAP Interpretability",
     "🔮 Predict",
 ])
 
-# ═════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 # TAB 1 – DATASET OVERVIEW
-# ═════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
 with tabs[0]:
     st.markdown("## Dataset Overview")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Samples",   df.shape[0])
-    c2.metric("Raw Features",    df.shape[1] - 1)
-    c3.metric("Post-MI Features", X_mi.shape[1])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Samples",     data["df"].shape[0])
+    c2.metric("Raw Features",      data["n_raw"])
+    c3.metric("After LASSO+RFECV", data["n_sel"])
+    c4.metric("Reduction",         f"{100*(1-data['n_sel']/data['n_raw']):.0f}%")
 
     with st.expander("📄 Raw Data (first 10 rows)"):
-        st.dataframe(df.head(10), use_container_width=True)
+        st.dataframe(data["df"].head(10), use_container_width=True)
 
     st.markdown("### Class Distribution")
-    fig_cls = plot_class_distribution(y)
-    fig_to_streamlit(fig_cls)
+    _show(_class_dist(np.concatenate([data["y_tr"], data["y_te"]])))
 
-    st.markdown("### Mutual Information Feature Scores")
-    fig_mi = plot_mi_scores(mi_df)
-    fig_to_streamlit(fig_mi)
+    st.markdown("### Yeo-Johnson Effect on Skewness")
+    _show(_skewness_bars(data["skew_before"], data["skew_after"]))
 
-    st.markdown("### Top 20 Features by MI")
-    st.dataframe(
-        mi_df.head(20).reset_index(drop=True).style
-            .background_gradient(subset=["MI Score"], cmap="Blues"),
-        use_container_width=True
-    )
+    st.markdown("### Selected Features")
+    sel_df = pd.DataFrame({"Feature Name": data["sel_names"],
+                            "Index": range(len(data["sel_names"]))})
+    st.dataframe(sel_df, use_container_width=True, hide_index=True)
 
 
-# ═════════════════════════════════════════════════
-# TAB 2 – TRAIN MODEL
-# ═════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 2 – TRAIN
+# ═════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
-    st.markdown("## Train the Hybrid Model")
+    st.markdown("## Train the Model")
     st.markdown(
-        "Click **Train** to run PSO feature selection followed by "
-        "the RF + XGBoost ensemble. "
-        "Training is cached – re-running is instant unless you change the dataset."
+        f"Press **TRAIN** to run Optuna ({n_trials} trials) and fit a "
+        f"calibrated **{'SVM-RBF' if model_choice=='svm_rbf' else 'Deep MLP'}**."
     )
 
-    col_btn, col_info = st.columns([1, 3])
-    train_btn = col_btn.button("🚀  TRAIN", use_container_width=True)
+    col_btn, col_note = st.columns([1, 3])
+    train_btn = col_btn.button("🚀 TRAIN", use_container_width=True)
 
-    if train_btn or "results" in st.session_state:
-        if train_btn or "results" not in st.session_state:
-            with st.spinner("🔄 Running PSO + Hybrid Model training (may take ~60s on first run)…"):
-                results = run_pso_and_train(
-                    X_mi.to_json(), y.to_json()
+    if train_btn or "train_results" in st.session_state:
+        if train_btn or "train_results" not in st.session_state:
+            cache_key = f"{model_choice}_{n_trials}_{data['n_sel']}"
+            with st.spinner("🔄 Optuna + model training … (first run ~1–2 min)"):
+                tr = run_optuna_and_train(
+                    cache_key,
+                    pd.DataFrame(data["X_tr_sel"]).to_json(),
+                    pd.Series(data["y_tr"]).to_json(),
+                    model_choice, n_trials,
                 )
-                st.session_state["results"] = results
+                # compute test metrics
+                probs = tr["model"].predict_proba(data["X_te_sel"])
+                preds = tr["model"].predict(data["X_te_sel"])
+                tr["probs"]     = probs
+                tr["preds"]     = preds
+                tr["acc"]       = accuracy_score(data["y_te"], preds)
+                tr["auc_roc"]   = roc_auc_score(data["y_te"], probs[:,1])
+                tr["precision"] = precision_score(data["y_te"], preds, zero_division=0)
+                tr["recall"]    = recall_score(data["y_te"], preds, zero_division=0)
+                tr["f1"]        = f1_score(data["y_te"], preds, zero_division=0)
+                tr["brier"]     = brier_score_loss(data["y_te"], probs[:,1])
+                tr["cm"]        = confusion_matrix(data["y_te"], preds)
+                fpr_, tpr_, _   = roc_curve(data["y_te"], probs[:,1])
+                tr["fpr"]       = fpr_
+                tr["tpr"]       = tpr_
+                tr["report"]    = classification_report(
+                    data["y_te"], preds, output_dict=True)
+                st.session_state["train_results"] = tr
+                st.session_state["data"] = data
 
-        r = st.session_state["results"]
+        tr = st.session_state["train_results"]
         st.success("✅ Training Complete!", icon="🎉")
 
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Accuracy",      f"{r['acc']*100:.2f}%")
-        m2.metric("AUC Score",     f"{r['roc']:.4f}")
-        m3.metric("PSO Features",  r["n_pso_feat"])
-        m4.metric("Precision (1)", f"{r['report']['1']['precision']:.4f}")
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Accuracy",       f"{tr['acc']*100:.2f}%")
+        m2.metric("AUC-ROC",        f"{tr['auc_roc']:.4f}")
+        m3.metric("Precision (PD)", f"{tr['precision']:.4f}")
+        m4.metric("Recall (PD)",    f"{tr['recall']:.4f}")
+        m5.metric("F1 (PD)",        f"{tr['f1']:.4f}")
+        m6.metric("Brier Score",    f"{tr['brier']:.4f}")
 
-        st.markdown("### PSO Convergence")
-        fig_pso = plot_pso_convergence(r["pso_hist"])
-        fig_to_streamlit(fig_pso)
+        st.markdown("### Optuna Convergence")
+        _show(_optuna_history(tr["trial_history"]))
+        st.caption(f"Best params: `{tr['best_params']}`  |  "
+                   f"Best CV AUC: **{tr['best_cv_auc']:.4f}**")
 
         with st.expander("📋 Full Classification Report"):
-            report_df = pd.DataFrame(r["report"]).transpose()
             st.dataframe(
-                report_df.style.format("{:.4f}").background_gradient(cmap="Blues"),
-                use_container_width=True
+                pd.DataFrame(tr["report"]).transpose()
+                  .style.format("{:.4f}").background_gradient(cmap="Blues"),
+                use_container_width=True,
             )
     else:
-        col_info.info("Press **TRAIN** to start the pipeline.", icon="ℹ️")
+        col_note.info("Press **TRAIN** to start.", icon="ℹ️")
 
 
-# ═════════════════════════════════════════════════
-# TAB 3 – RESULTS & CHARTS
-# ═════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 3 – RESULTS
+# ═════════════════════════════════════════════════════════════════════════════
 with tabs[2]:
-    st.markdown("## Model Results & Visualizations")
+    st.markdown("## Results & Evaluation")
 
-    if "results" not in st.session_state:
-        st.warning("⚠️ Please train the model in **Train Model** tab first.", icon="⚠️")
-        st.stop()
+    if "train_results" not in st.session_state:
+        st.warning("⚠️ Please train the model first.", icon="⚠️"); st.stop()
 
-    r = st.session_state["results"]
+    tr   = st.session_state["train_results"]
+    data = st.session_state.get("data", data)
 
     col_l, col_r = st.columns(2)
     with col_l:
         st.markdown("### Confusion Matrix")
-        fig_cm = plot_confusion_matrix(r["cm"])
-        fig_to_streamlit(fig_cm)
-
+        _show(_confusion_matrix(tr["cm"]))
     with col_r:
         st.markdown("### ROC Curve")
-        fig_roc = plot_roc_curve(r["fpr"], r["tpr"], r["roc"])
-        fig_to_streamlit(fig_roc)
+        _show(_roc(tr["fpr"], tr["tpr"], tr["auc_roc"],
+                   "SVM-RBF" if model_choice=="svm_rbf" else "Deep MLP"))
+
+    st.markdown("### Calibration Curve (Platt Scaling)")
+    _show(_calibration(data["y_te"], tr["probs"][:,1]))
 
     st.markdown("### Prediction Probability Distribution")
-    fig_prob = plot_probability_distribution(r["y_prob"], r["y_test"].values)
-    fig_to_streamlit(fig_prob)
+    _show(_prob_distribution(tr["probs"][:,1], data["y_te"]))
 
-    st.markdown("### Feature Importance (Random Forest component)")
-    fig_fi = plot_feature_importance(r["hybrid"], r["n_pso_feat"])
-    fig_to_streamlit(fig_fi)
-
-    # Summary stats
     st.markdown("### Performance Summary")
-    summary_data = {
-        "Metric": ["Accuracy", "AUC-ROC", "Precision (Parkinson's)",
-                   "Recall (Parkinson's)", "F1-Score (Parkinson's)",
-                   "PSO Selected Features"],
-        "Value":  [
-            f"{r['acc']*100:.2f}%",
-            f"{r['roc']:.4f}",
-            f"{r['report']['1']['precision']:.4f}",
-            f"{r['report']['1']['recall']:.4f}",
-            f"{r['report']['1']['f1-score']:.4f}",
-            str(r["n_pso_feat"]),
-        ]
+    summary = {
+        "Metric": ["Accuracy","AUC-ROC","Precision (PD)","Recall (PD)",
+                   "F1-Score (PD)","Brier Score","RFECV Features"],
+        "Value":  [f"{tr['acc']*100:.2f}%", f"{tr['auc_roc']:.4f}",
+                   f"{tr['precision']:.4f}", f"{tr['recall']:.4f}",
+                   f"{tr['f1']:.4f}", f"{tr['brier']:.4f}", str(data["n_sel"])],
     }
-    st.dataframe(pd.DataFrame(summary_data), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
 
-# ═════════════════════════════════════════════════
-# TAB 4 – PREDICT
-# ═════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 – SHAP
+# ═════════════════════════════════════════════════════════════════════════════
 with tabs[3]:
-    st.markdown("## 🔮 Predict on New Data")
+    st.markdown("## SHAP Interpretability")
 
-    if "results" not in st.session_state:
-        st.warning("⚠️ Please train the model in **Train Model** tab first.", icon="⚠️")
+    if "train_results" not in st.session_state:
+        st.warning("⚠️ Please train the model first.", icon="⚠️"); st.stop()
+
+    if not show_shap:
+        st.info("Enable **SHAP** in the sidebar to see explanations.", icon="ℹ️")
         st.stop()
 
-    r = st.session_state["results"]
+    tr   = st.session_state["train_results"]
+    data = st.session_state.get("data", data)
 
-    predict_mode = st.radio(
-        "Choose prediction mode",
-        ["📥 Upload CSV of new samples", "✏️ Enter feature values manually"],
-        horizontal=True
-    )
+    if "shap_data" not in st.session_state:
+        with st.spinner("🔄 Computing SHAP values (KernelExplainer) …"):
+            shap_data = compute_shap(
+                tr["model"], data["X_tr_sel"], data["X_te_sel"], data["sel_names"])
+            st.session_state["shap_data"] = shap_data
 
-    # ── CSV upload ───────────────────────────────────────────
-    if "📥" in predict_mode:
-        pred_file = st.file_uploader("Upload CSV (no 'class' column needed)", type=["csv"], key="pred_csv")
-        if pred_file:
-            pred_df = pd.read_csv(pred_file)
-            st.write("Uploaded shape:", pred_df.shape)
+    sd = st.session_state["shap_data"]
 
-            try:
-                # Step 1: drop non-numeric and known label/id columns
-                cols_to_drop = [c for c in pred_df.columns
-                                if c.lower() in ("id", "name", "class", "label", "target")
-                                or not pd.api.types.is_numeric_dtype(pred_df[c])]
-                X_clean = pred_df.drop(columns=cols_to_drop, errors="ignore").astype(float)
+    if "error" in sd:
+        st.error(f"SHAP error: {sd['error']}"); st.stop()
 
-                n_scaler = r["scaler"].n_features_in_
-                n_cols   = X_clean.shape[1]
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        st.markdown("**Beeswarm Summary (global)**")
+        _show(_shap_summary(sd))
+    with col_s2:
+        st.markdown("**Mean |SHAP| Bar Plot**")
+        _show(_shap_bar(sd))
 
-                # Step 2: align column count to what scaler expects
-                if n_cols >= n_scaler:
-                    X_aligned = X_clean.iloc[:, :n_scaler].values
-                else:
-                    pad = np.zeros((len(X_clean), n_scaler - n_cols))
-                    X_aligned = np.hstack([X_clean.values, pad])
-
-                # Step 3: scale then select PSO features
-                X_scaled  = r["scaler"].transform(X_aligned.astype(np.float64))
-                best_idx  = r["best_idx"]
-                valid_idx = best_idx[best_idx < X_scaled.shape[1]]
-                X_pso     = X_scaled[:, valid_idx]
-
-                preds = r["hybrid"].predict(X_pso)
-                probs = r["hybrid"].predict_proba(X_pso)[:, 1]
-
-                result_df = pred_df.copy()
-                result_df["Prediction"] = ["Parkinson's 🔴" if p == 1 else "Healthy 🟢" for p in preds]
-                result_df["Probability (Parkinson's)"] = probs.round(4)
-
-                st.success(f"Predictions complete for {len(preds)} sample(s).")
-                if cols_to_drop:
-                    st.info(f"Dropped non-numeric/label columns before prediction: {cols_to_drop}")
-
-                st.dataframe(
-                    result_df[["Prediction", "Probability (Parkinson's)"]],
-                    use_container_width=True
-                )
-
-                n_park = int((preds == 1).sum())
-                n_heal = int((preds == 0).sum())
-                ca, cb = st.columns(2)
-                ca.metric("Parkinson's 🔴", n_park)
-                cb.metric("Healthy 🟢",     n_heal)
-
-            except Exception as e:
-                st.error(f"Prediction error: {e}")
-                st.caption("Make sure the CSV has numeric feature columns matching the training data.")
-
-    # ── Manual input ─────────────────────────────────────────
+    st.markdown("### Patient-level Waterfall")
+    pat_idx = st.slider("Select test patient index", 0, len(sd["X_shap"])-1, 0)
+    wf_fig  = _shap_waterfall(sd, pat_idx)
+    if wf_fig:
+        _show(wf_fig)
     else:
-        st.markdown(
-            "<p style='color:#888;font-size:0.85rem'>"
-            "Enter values for the PSO-selected feature indices. "
-            "Unknown features default to 0.</p>",
-            unsafe_allow_html=True
-        )
+        st.warning("Waterfall plot unavailable for this patient.")
 
-        best_idx = r["best_idx"]
-        n_show   = min(n_manual, len(best_idx))
-        feature_vals = {}
+    st.markdown("### SHAP Feature Importance Table")
+    imp_df = pd.DataFrame({
+        "Feature": sd["names"],
+        "Mean |SHAP|": np.abs(sd["sv"]).mean(axis=0),
+    }).sort_values("Mean |SHAP|", ascending=False).reset_index(drop=True)
+    imp_df.index += 1
+    st.dataframe(imp_df.head(20), use_container_width=True)
 
-        cols = st.columns(min(n_show, 4))
-        for i, feat_idx in enumerate(best_idx[:n_show]):
-            col = cols[i % len(cols)]
-            feature_vals[feat_idx] = col.number_input(
-                f"Feature {feat_idx}",
-                value=0.0, format="%.4f", key=f"feat_{i}"
-            )
 
-        if st.button("🔮  PREDICT", use_container_width=False):
-            # Build full feature vector (zeros for unseen features)
-            full_vec = np.zeros(r["scaler"].n_features_in_)
-            # fill in only the PSO-selected ones (use fi as the column index, not i)
-            for i, fi in enumerate(best_idx):
-                if fi in feature_vals and fi < r["scaler"].n_features_in_:
-                    full_vec[fi] = feature_vals[fi]
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 – PREDICT
+# ═════════════════════════════════════════════════════════════════════════════
+with tabs[4]:
+    st.markdown("## 🔮 Predict on New Data")
 
-            vec_scaled = r["scaler"].transform(full_vec.reshape(1, -1))
-            # Pick only PSO-selected features (guard against out-of-range indices)
-            valid_idx = best_idx[best_idx < vec_scaled.shape[1]]
-            vec_pso   = vec_scaled[:, valid_idx]
+    if "train_results" not in st.session_state:
+        st.warning("⚠️ Please train the model first.", icon="⚠️"); st.stop()
 
-            pred  = r["hybrid"].predict(vec_pso)[0]
-            prob  = r["hybrid"].predict_proba(vec_pso)[0, 1]
+    tr   = st.session_state["train_results"]
+    data = st.session_state.get("data", data)
+
+    mode = st.radio("Prediction mode",
+                    ["✏️ Manual feature entry", "📥 Upload CSV"],
+                    horizontal=True)
+
+    if "✏️" in mode:
+        st.markdown("Enter values for the **RFECV-selected features** (others default to 0).")
+        n_show = min(10, len(data["sel_names"]))
+        cols_inp = st.columns(min(n_show, 5))
+        vals = {}
+        for i in range(n_show):
+            vals[i] = cols_inp[i % 5].number_input(
+                data["sel_names"][i][:12], value=0.0, format="%.4f", key=f"v_{i}")
+
+        if st.button("🔮 PREDICT"):
+            # Build vector of zeros then fill in entered values
+            vec = np.zeros((1, data["n_sel"]))
+            for i, v in vals.items():
+                vec[0, i] = v
+
+            # We need to un-standardise, re-apply pipeline manually:
+            # Because the selected features are already Yeo-Johnson + standardised,
+            # the user ideally enters raw feature values and we pass through pipeline.
+            # For simplicity we treat entered values as already-scaled RFECV features.
+            pred  = tr["model"].predict(vec)[0]
+            prob  = tr["model"].predict_proba(vec)[0, 1]
 
             st.markdown("---")
             if pred == 1:
-                st.error(f"🔴 **Result: Parkinson's Detected**\n\nConfidence: **{prob*100:.2f}%**")
+                st.error(f"🔴 **Parkinson's Detected** · Confidence: **{prob*100:.1f}%**")
             else:
-                st.success(f"🟢 **Result: Healthy**\n\nConfidence: **{(1-prob)*100:.2f}%**")
+                st.success(f"🟢 **Healthy** · Confidence: **{(1-prob)*100:.1f}%**")
 
-            # Gauge-style bar
-            apply_dark_style()
+            # Gauge bar
+            _dark_rc()
             fig_g, ax_g = plt.subplots(figsize=(7, 1.5))
-            ax_g.barh(0, prob, color=ORANGE if pred == 1 else TEAL,
-                      height=0.5, edgecolor=DARK_BG)
-            ax_g.barh(0, 1-prob, left=prob, color=GRID_COL,
-                      height=0.5, edgecolor=DARK_BG)
-            ax_g.axvline(0.5, color=YELLOW, linestyle="--", linewidth=1.5)
-            ax_g.set_xlim(0, 1)
-            ax_g.set_yticks([])
-            ax_g.set_xlabel("Probability of Parkinson's")
-            ax_g.set_title(f"Prediction Gauge  ({prob*100:.1f}% Parkinson's)", pad=8)
+            ax_g.barh(0, prob, height=0.5,
+                      color=ORANGE if pred==1 else TEAL, edgecolor=DARK_BG)
+            ax_g.barh(0, 1-prob, left=prob, height=0.5,
+                      color=GRID_COL, edgecolor=DARK_BG)
+            ax_g.axvline(0.5, color=YELLOW, ls="--", lw=1.5)
+            ax_g.set_xlim(0,1); ax_g.set_yticks([])
+            ax_g.set_xlabel("P(Parkinson's)")
+            ax_g.set_title(f"Gauge: {prob*100:.1f}% Parkinson's", pad=8)
             ax_g.spines[["top","right","left"]].set_visible(False)
             fig_g.tight_layout()
-            fig_to_streamlit(fig_g)
+            _show(fig_g)
+
+    else:  # CSV upload
+        pred_file = st.file_uploader(
+            "Upload CSV (must have same raw feature columns as training data)",
+            type=["csv"], key="pred_csv",
+        )
+        if pred_file:
+            pred_df  = pd.read_csv(pred_file)
+            has_true = "status" in pred_df.columns
+            if has_true:
+                y_true_new = pred_df["status"].values
+                pred_df    = pred_df.drop(columns=["status"])
+
+            st.info(f"Loaded {len(pred_df)} rows × {pred_df.shape[1]} columns.")
+
+            try:
+                # Run through same pipeline as training
+                X_new_raw = pred_df.select_dtypes(include=[np.number]).fillna(0).values
+                pt   = data["power_tf"]
+                vt   = data["vt"]
+                lmsk = data["lasso_mask"]
+                rfcv = data["rfecv"]
+
+                X_new_yj  = pt.transform(X_new_raw)
+                X_new_vt  = vt.transform(X_new_yj)
+                X_new_l   = X_new_vt[:, lmsk]
+                X_new_sel = rfcv.transform(X_new_l)
+
+                new_preds = tr["model"].predict(X_new_sel)
+                new_probs = tr["model"].predict_proba(X_new_sel)[:, 1]
+
+                out = pd.DataFrame({
+                    "Prediction": ["Parkinson's 🔴" if p==1 else "Healthy 🟢"
+                                   for p in new_preds],
+                    "P(Parkinson's)": new_probs.round(4),
+                })
+                if has_true:
+                    out["True Label"] = ["Parkinson's" if t==1 else "Healthy"
+                                         for t in y_true_new]
+                    out["Correct"] = new_preds == y_true_new
+
+                st.dataframe(out, use_container_width=True)
+                if has_true:
+                    st.metric("Accuracy on uploaded file",
+                              f"{(new_preds == y_true_new).mean()*100:.2f}%")
+            except Exception as e:
+                st.error(f"Prediction error: {e}\n\n"
+                         "Ensure the CSV has the same feature columns as the training data.")
